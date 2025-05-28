@@ -1,0 +1,320 @@
+'''
+This code is used for Running throught he GDA WARD images
+and classifying all images into high dump or low dump . 
+Much better if you are using GPU instead if CPU.'''
+
+
+import torch
+import cv2
+import numpy as np
+import os
+from detectron2.config import get_cfg
+from detectron2.engine import DefaultPredictor
+from detectron2.utils.visualizer import Visualizer, ColorMode
+from detectron2.data import MetadataCatalog
+import glob
+import pandas as pd
+from datetime import datetime
+
+# Please chnage this into your pathway where the pth and yaml files are stores
+model_path = r"C:\Users\wasee\output\model_final.pth"
+config_path = r"C:\Users\wasee\Downloads\waste_segmentation_model-20250309T121246Z-001\waste_segmentation_model\model_config.yaml"
+
+# Please chnage into your folder where images are sorted based on the ward
+main_folder = r"C:\Users\wasee\OneDrive\Desktop\ceew project\recentmonthsoflatestanalysisnovdecjanfebmar"
+
+# Master summary file
+master_summary_path = os.path.join(main_folder, "master_summary.csv")
+
+# Check if model exists
+print(f"Model exists: {os.path.exists(model_path)}")
+
+# Load configuration
+cfg = get_cfg()
+if os.path.exists(config_path):
+    print("Loading saved config file...")
+    cfg.merge_from_file(config_path)
+else:
+    print("Config file not found, recreating config...")
+    from detectron2.model_zoo import get_config_file
+    cfg_file = "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+    cfg.merge_from_file(get_config_file(cfg_file))
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1  # Adjust based on your training setup
+
+# Set model weights and inference threshold
+cfg.MODEL.WEIGHTS = model_path
+cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5  # Adjust threshold as needed
+
+# Create predictor
+predictor = DefaultPredictor(cfg)
+
+# Set up metadata
+metadata = MetadataCatalog.get("waste_inference")
+metadata.thing_classes = ["waste"]  # Adjust based on your classes
+
+# Function to classify waste dump #please note here you can modify the algorithm . we can use number of instances also . Sometimes may be combination of number of instances and pixel pencentages.
+def classify_waste_dump(percentage):
+    if percentage < 4:
+        return "Low Dump"
+    elif percentage <= 35:
+        return "Medium Dump"
+    else:
+        return "Heavy Dump"
+
+# Function to process a single image
+def process_image(image_path, output_folder):
+    img = cv2.imread(image_path)
+
+    if img is None:
+        print(f"Error: Could not read image at {image_path}")
+        return None
+
+    # Get image dimensions for area calculations
+    height, width = img.shape[:2]
+    total_image_area = height * width
+    
+    # Run inference
+    outputs = predictor(img)
+
+    # Get detection results
+    instances = outputs["instances"].to("cpu")
+    num_detections = len(instances)
+
+    # Extract image name from path for saving results
+    image_name = os.path.splitext(os.path.basename(image_path))[0]
+
+    # Initialize result dictionary
+    result = {
+        "Image": image_name,
+        "Width": width,
+        "Height": height,
+        "TotalArea": total_image_area,
+        "WasteArea": 0,
+        "WastePercentage": 0.0,
+        "Classification": "No Waste",
+        "NumInstances": 0
+    }
+
+    # Calculate area of waste
+    if num_detections > 0 and instances.has("pred_masks"):
+        # Get the binary masks
+        masks = instances.pred_masks.numpy()
+        scores = instances.scores.numpy()
+
+        # Create a combined mask for all waste instances
+        combined_mask = np.zeros((height, width), dtype=bool)
+
+        # Add all instances to the combined mask
+        for i in range(num_detections):
+            mask = masks[i]
+            combined_mask = np.logical_or(combined_mask, mask)
+
+        # Calculate total waste area (accounting for any overlaps)
+        total_waste_area = combined_mask.sum()
+        waste_percentage = (total_waste_area / total_image_area) * 100
+
+        # Classify the waste dump
+        dump_classification = classify_waste_dump(waste_percentage)
+
+        # Update result dictionary
+        result["WasteArea"] = total_waste_area
+        result["WastePercentage"] = waste_percentage
+        result["Classification"] = dump_classification
+        result["NumInstances"] = num_detections
+
+        # Visualize the combined mask
+        combined_vis = np.zeros_like(img)
+        combined_vis[combined_mask] = [0, 0, 255]  # Red for combined mask
+        final_image = cv2.addWeighted(img, 1, combined_vis, 0.5, 0)
+
+        # Choose text color based on classification
+        if dump_classification == "Low Dump":
+            text_color = (0, 255, 0)  # Green
+        elif dump_classification == "Medium Dump":
+            text_color = (0, 165, 255)  # Orange
+        else:
+            text_color = (0, 0, 255)  # Red
+    else:
+        # No waste detected
+        final_image = img.copy()
+        text_color = (0, 255, 0)  # Green
+
+    # Add classification text to the image
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.5
+    thickness = 3
+
+    # Get text size to position it
+    text = f"{result['Classification']}: {result['WastePercentage']:.2f}%"
+    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+    text_x = 10
+    text_y = height - 20
+
+    # Draw a background rectangle for the text
+    cv2.rectangle(final_image,
+                 (text_x - 5, text_y - text_size[1] - 5),
+                 (text_x + text_size[0] + 5, text_y + 5),
+                 (255, 255, 255),
+                 -1)
+
+    # Add text to the image
+    cv2.putText(final_image,
+               text,
+               (text_x, text_y),
+               font,
+               font_scale,
+               text_color,
+               thickness)
+
+    # Save the final classified image
+    final_path = os.path.join(output_folder, f"{image_name}_classified.jpg")
+    cv2.imwrite(final_path, final_image)
+
+    return result
+
+# Function to get all subfolders
+def get_all_subfolders(main_folder):
+    # Get all folders including the main folder
+    folders = [main_folder]
+    
+    # Add all subfolders
+    for dirpath, dirnames, filenames in os.walk(main_folder):
+        for dirname in dirnames:
+            folders.append(os.path.join(dirpath, dirname))
+            
+    return folders
+
+# Create master DataFrame to store all results
+master_df = pd.DataFrame(columns=[
+    "Folder", "TotalImages", "ImagesWithWaste", "NoWasteImages", 
+    "LowDumpCount", "MediumDumpCount", "HeavyDumpCount",
+    "AverageWastePercentage", "MaxWastePercentage", "ProcessingTime"
+])
+
+# Get all subfolders to process
+all_folders = get_all_subfolders(main_folder)
+print(f"Found {len(all_folders)} folders to process")
+
+# Process each folder
+for folder_idx, folder_path in enumerate(all_folders):
+    folder_name = os.path.basename(folder_path)
+    print(f"\n[{folder_idx+1}/{len(all_folders)}] Processing folder: {folder_name}")
+    
+    # Create output folder inside the current folder
+    output_folder = os.path.join(folder_path, "resultsnew")
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Create summary file for this folder
+    summary_file = os.path.join(output_folder, f"{folder_name}_summary.csv")
+    
+    # Get all image files in the folder
+    image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        # Also check for case variations
+        image_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+    
+    print(f"Found {len(image_files)} images in folder {folder_name}")
+    
+    if not image_files:
+        print(f"No images found in folder {folder_name}, skipping...")
+        continue
+    
+    # Initialize counters and data storage
+    folder_results = []
+    start_time = datetime.now()
+    
+    # Process each image in the folder
+    for image_idx, image_path in enumerate(image_files):
+        print(f"  [{image_idx+1}/{len(image_files)}] Processing image: {os.path.basename(image_path)}")
+        
+        # Process the image
+        result = process_image(image_path, output_folder)
+        
+        if result:
+            folder_results.append(result)
+    
+    # Create and save DataFrame for this folder
+    if folder_results:
+        folder_df = pd.DataFrame(folder_results)
+        folder_df.to_csv(summary_file, index=False)
+        print(f"Summary for folder saved to: {summary_file}")
+        
+        # Calculate statistics for master summary
+        processing_time = (datetime.now() - start_time).total_seconds()
+        low_dump_count = sum(folder_df['Classification'] == 'Low Dump')
+        medium_dump_count = sum(folder_df['Classification'] == 'Medium Dump')
+        heavy_dump_count = sum(folder_df['Classification'] == 'Heavy Dump')
+        images_with_waste = low_dump_count + medium_dump_count + heavy_dump_count
+        no_waste_images = sum(folder_df['Classification'] == 'No Waste')
+        
+        # Calculate averages only from images with waste
+        waste_df = folder_df[folder_df['Classification'] != 'No Waste']
+        avg_waste_percentage = waste_df['WastePercentage'].mean() if not waste_df.empty else 0
+        max_waste_percentage = waste_df['WastePercentage'].max() if not waste_df.empty else 0
+        
+        # Add to master DataFrame
+        master_df = pd.concat([master_df, pd.DataFrame([{
+            "Folder": folder_name,
+            "TotalImages": len(folder_results),
+            "ImagesWithWaste": images_with_waste,
+            "NoWasteImages": no_waste_images,
+            "LowDumpCount": low_dump_count,
+            "MediumDumpCount": medium_dump_count,
+            "HeavyDumpCount": heavy_dump_count,
+            "AverageWastePercentage": avg_waste_percentage,
+            "MaxWastePercentage": max_waste_percentage,
+            "ProcessingTime": processing_time
+        }])], ignore_index=True)
+
+# Save master summary
+if not master_df.empty:
+    master_df.to_csv(master_summary_path, index=False)
+    print(f"\nMaster summary saved to: {master_summary_path}")
+
+    # Create an overall statistics summary
+    total_folders = len(master_df)
+    total_images = master_df['TotalImages'].sum()
+    total_waste_images = master_df['ImagesWithWaste'].sum()
+    total_no_waste = master_df['NoWasteImages'].sum()
+    total_low = master_df['LowDumpCount'].sum()
+    total_medium = master_df['MediumDumpCount'].sum()
+    total_high = master_df['HeavyDumpCount'].sum()
+    
+    overall_avg_percentage = master_df['AverageWastePercentage'].mean()
+    overall_max_percentage = master_df['MaxWastePercentage'].max()
+    
+    # Create overall summary DataFrame
+    overall_df = pd.DataFrame([{
+        "TotalFolders": total_folders,
+        "TotalImages": total_images,
+        "TotalImagesWithWaste": total_waste_images,
+        "TotalNoWasteImages": total_no_waste,
+        "TotalLowDump": total_low,
+        "TotalMediumDump": total_medium,
+        "TotalHighDump": total_high,
+        "OverallAverageWastePercentage": overall_avg_percentage,
+        "OverallMaxWastePercentage": overall_max_percentage,
+        "ProcessDate": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }])
+    
+    # Save overall summary
+    overall_summary_path = os.path.join(main_folder, "overall_summary.csv")
+    overall_df.to_csv(overall_summary_path, index=False)
+    print(f"Overall summary saved to: {overall_summary_path}")
+    
+    # Print summary statistics
+    print("\n===== PROCESSING SUMMARY =====")
+    print(f"Total folders processed: {total_folders}")
+    print(f"Total images processed: {total_images}")
+    print(f"Images with waste: {total_waste_images} ({total_waste_images/total_images*100:.1f}%)")
+    print(f"Images without waste: {total_no_waste} ({total_no_waste/total_images*100:.1f}%)")
+    print(f"Low dumps: {total_low} ({total_low/total_images*100:.1f}%)")
+    print(f"Medium dumps: {total_medium} ({total_medium/total_images*100:.1f}%)")
+    print(f"High dumps: {total_high} ({total_high/total_images*100:.1f}%)")
+    print(f"Overall average waste percentage: {overall_avg_percentage:.2f}%")
+    print(f"Overall maximum waste percentage: {overall_max_percentage:.2f}%")
+    print("==============================")
+
+print("\nAll processing complete!")
