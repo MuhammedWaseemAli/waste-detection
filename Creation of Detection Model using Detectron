@@ -1,0 +1,224 @@
+'''
+Please save all the images you use for training in the folder and annotate them with any online annotation software you prefer (I used MakeSense AI).
+This script first converts your VGG (image-annotation) JSON into the COCO format and registers it as a Detectron2 dataset.
+It then loads a pre-trained Mask R-CNN (ResNet-50 + FPN) configuration, tweaks the hyper-parameters for a single “waste” class, and trains the model on the registered images.
+After training, it evaluates the model with a COCO evaluator, saves the learned weights to waste_segmentation_model.pth, and also retains Detectron2’s model_final.pth.
+'''
+
+import torch
+print("Torch CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Using GPU:", torch.cuda.get_device_name(0))
+
+import json
+import os
+from PIL import Image
+import cv2
+import random
+
+# Detectron2 imports
+import detectron2
+from detectron2.utils.logger import setup_logger
+setup_logger()
+
+from detectron2.engine import DefaultTrainer
+from detectron2.config import get_cfg
+from detectron2.model_zoo import get_config_file, get_checkpoint_url
+from detectron2.data import DatasetCatalog, MetadataCatalog, build_detection_test_loader
+from detectron2.data.datasets import register_coco_instances
+from detectron2.evaluation import COCOEvaluator, inference_on_dataset
+from detectron2.utils.visualizer import Visualizer
+
+
+
+# ======================= 3. DEFINE HELPER FUNCTION (VGG to COCO) =======================
+def vgg_to_coco(vgg_json_path, output_path, image_dir):
+    """
+    Converts VGG JSON annotation format to COCO format for instance segmentation.
+    """
+    with open(vgg_json_path) as f:
+        vgg_data = json.load(f)
+
+    # Adjust category list to match your classes/labels
+    coco_format = {
+        "images": [],
+        "annotations": [],
+        "categories": [
+            {"id": 1, "name": "waste"},
+            {"id": 2, "name": "not waste"}
+        ]
+    }
+
+    annotation_id = 1
+    for image_id, (filename, file_data) in enumerate(vgg_data.items()):
+        img_path = os.path.join(image_dir, filename)
+
+        # Load image dimensions
+        try:
+            with Image.open(img_path) as img:
+                width, height = img.size
+        except FileNotFoundError:
+            print(f"Image {filename} not found in {image_dir}. Skipping.")
+            continue
+
+        # Add image metadata
+        coco_format['images'].append({
+            "id": image_id,
+            "file_name": filename,
+            "width": width,
+            "height": height
+        })
+
+        # Process regions (polygons)
+        for region_id, region in file_data['regions'].items():
+            shape_attributes = region['shape_attributes']
+            region_attributes = region['region_attributes']
+
+            if 'all_points_x' not in shape_attributes or 'all_points_y' not in shape_attributes:
+                print(f"Skipping region {region_id} in {filename} due to missing points.")
+                continue
+
+            x_points = shape_attributes['all_points_x']
+            y_points = shape_attributes['all_points_y']
+            polygon = [[x, y] for x, y in zip(x_points, y_points)]
+
+            # Retrieve label
+            label = region_attributes.get('label', '').strip().lower()
+            if label == 'waste':
+                category_id = 1
+            elif label == 'not waste':
+                category_id = 2
+            else:
+                print(f"Skipping region {region_id} in {filename} due to unknown label: {label}")
+                continue
+
+            coco_format['annotations'].append({
+                "id": annotation_id,
+                "image_id": image_id,
+                "category_id": category_id,
+                "segmentation": [sum(polygon, [])],  # Flatten the list of coordinates
+                "area": 0,  # You can compute actual area if needed
+                "bbox": [
+                    min(x_points),
+                    min(y_points),
+                    max(x_points) - min(x_points),
+                    max(y_points) - min(y_points)
+                ],
+                "iscrowd": 0
+            })
+            annotation_id += 1
+
+    # Save COCO annotations
+    with open(output_path, 'w') as f:
+        json.dump(coco_format, f, indent=4)
+
+
+# ======================= 4. PATHS AND DATA PREPARATION =======================
+vgg_json_path = r"C:\emission work\neccassities\labels_my-project-name_2025-03-11-12-06-39.json"
+output_coco_path = r"C:\emission work\neccassities\labels_my-project-name_coco_annotations.json"
+image_dir = r"C:\emission work\newmodelcreation"
+dataset_path = r"C:\emission work\newmodelcreation"
+
+# Convert VGG to COCO
+print("Converting VGG annotations to COCO format...")
+vgg_to_coco(vgg_json_path, output_coco_path, image_dir)
+
+# Verify dataset directory
+print("Files in dataset path:", os.listdir(dataset_path))
+
+
+# ======================= 5. REGISTER DATASET =======================
+dataset_name = "waste_segmentation1"
+
+register_coco_instances(dataset_name, {}, output_coco_path, image_dir)
+
+# Load dataset for verification
+dataset_dicts = DatasetCatalog.get(dataset_name)
+print(f"Number of images in {dataset_name}:", len(dataset_dicts))
+
+# (Optional) Visualize the first few samples
+print("\nVisualizing a few samples from the dataset...")
+#for d in dataset_dicts[:3]:
+    #img = cv2.imread(d["file_name"])
+    #visualizer = Visualizer(img[:, :, ::-1], metadata=MetadataCatalog.get(dataset_name))
+    #vis = visualizer.draw_dataset_dict(d)
+    #cv2_imshow(vis.get_image()[:, :, ::-1])
+
+
+# ======================= 6. SETUP CONFIG FOR DETECTRON2 MODEL =======================
+cfg = get_cfg()
+cfg_file = "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+cfg.merge_from_file(get_config_file(cfg_file))
+
+# Datasets
+cfg.DATASETS.TRAIN = (dataset_name,)
+cfg.DATASETS.TEST = ()
+
+# Dataloader
+cfg.DATALOADER.NUM_WORKERS = 2
+
+# Model weights (pretrained)
+cfg.MODEL.WEIGHTS = get_checkpoint_url(cfg_file)
+
+# Solver settings
+cfg.SOLVER.IMS_PER_BATCH = 2        # Adjust if you get OOM errors
+cfg.SOLVER.BASE_LR = 0.00025        # Learning rate
+cfg.SOLVER.MAX_ITER = 300           # Adjust based on dataset size
+cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 128
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1  # Only 1 class ('waste') if you only want to detect "waste" vs. background
+
+# Create output directory
+os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+
+# ======================= 7. TRAIN THE MODEL =======================
+trainer = DefaultTrainer(cfg)
+trainer.resume_or_load(resume=False)
+print("\nStarting training...")
+trainer.train()
+
+# ======================= 8. EVALUATE THE MODEL =======================
+# Register the same dataset for validation if you have a separate val set.
+# For demonstration, we'll evaluate on the same training set.
+evaluator = COCOEvaluator(dataset_name, cfg, False, output_dir=cfg.OUTPUT_DIR)
+val_loader = build_detection_test_loader(cfg, dataset_name)
+eval_results = inference_on_dataset(trainer.model, val_loader, evaluator)
+print("Evaluation results:", eval_results)
+
+# ======================= 9. SAVE THE TRAINED MODEL (.pth) =======================
+model_weights_path = os.path.join(cfg.OUTPUT_DIR, "waste_segmentation_model.pth")
+torch.save(trainer.model.state_dict(), model_weights_path)
+print(f"\nModel saved to: {model_weights_path}")
+
+
+# ======================= 10. OPTIONAL: INFERENCE ON RANDOM DATASET IMAGES =======================
+# To run inference, we need a predictor:
+from detectron2.engine import DefaultPredictor
+
+cfg.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")  # or use your saved .pth
+cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5  # set the testing threshold
+predictor = DefaultPredictor(cfg)
+
+# Visualize predictions on random samples
+print("\nVisualizing predictions on random dataset images...")
+metadata = MetadataCatalog.get(dataset_name)
+for d in random.sample(dataset_dicts, 3):
+    img = cv2.imread(d["file_name"])
+    outputs = predictor(img)
+    v = Visualizer(img[:, :, ::-1], metadata=metadata, scale=0.8)
+    out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
+    cv2_imshow(out.get_image()[:, :, ::-1])
+
+
+# ======================= 11. OPTIONAL: INFERENCE ON A CUSTOM IMAGE =======================
+# Update the path to a custom image if desired
+custom_image_path = "/content/image_253.jpg"
+if os.path.isfile(custom_image_path):
+    print("\nRunning inference on custom image:", custom_image_path)
+    custom_img = cv2.imread(custom_image_path)
+    outputs = predictor(custom_img)
+    v = Visualizer(custom_img[:, :, ::-1], metadata=metadata, scale=0.8)
+    out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
+    cv2_imshow(out.get_image()[:, :, ::-1])
+else:
+    print("\nCustom image not found:", custom_image_path)
+
